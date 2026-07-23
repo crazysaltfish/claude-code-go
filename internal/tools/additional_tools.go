@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"claude-code-go/internal/constants"
 	"claude-code-go/internal/types"
@@ -393,18 +396,41 @@ type ToolSearchTool struct {
 	registry *Registry
 }
 
+const (
+	bm25K1                 = 1.2
+	bm25B                  = 0.75
+	defaultToolSearchLimit = 10
+	maxToolSearchLimit     = 50
+)
+
+type bm25ToolDocument struct {
+	tool        types.Tool
+	description string
+	terms       map[string]float64
+	length      float64
+}
+
+type bm25ToolMatch struct {
+	document bm25ToolDocument
+	score    float64
+}
+
 // NewToolSearchTool creates a new tool search tool.
 func NewToolSearchTool(registry *Registry) *ToolSearchTool {
 	return &ToolSearchTool{
 		BaseTool: &BaseTool{
 			name:        "ToolSearch",
-			description: "Search for available tools by name or description",
+			description: "Search available tools using BM25 relevance ranking over names, aliases, descriptions, and input fields",
 			inputSchema: types.ToolInputJSONSchema{
 				Type: "object",
 				Properties: map[string]map[string]interface{}{
 					"query": {
 						"type":        "string",
 						"description": "Search query",
+					},
+					"max_results": {
+						"type":        "integer",
+						"description": "Maximum number of ranked tools to return (default 10, maximum 50)",
 					},
 				},
 				Required: []string{"query"},
@@ -419,36 +445,208 @@ func NewToolSearchTool(registry *Registry) *ToolSearchTool {
 // Call searches for tools.
 func (t *ToolSearchTool) Call(ctx context.Context, args json.RawMessage, toolCtx *types.ToolContext, canUseTool types.CanUseToolFunc, parentMessage *types.Message, onProgress func(progress interface{})) (*types.ToolResult, error) {
 	var input struct {
-		Query string `json:"query"`
+		Query      string `json:"query"`
+		MaxResults int    `json:"max_results,omitempty"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("failed to parse input: %w", err)
 	}
 
-	var results []string
-	query := strings.ToLower(input.Query)
-
-	for _, tool := range t.registry.ListEnabled() {
-		name := strings.ToLower(tool.Name())
-		desc, _ := tool.Description(ctx, nil, types.ToolOptions{})
-		descLower := strings.ToLower(desc)
-
-		if strings.Contains(name, query) || strings.Contains(descLower, query) {
-			results = append(results, fmt.Sprintf("- %s: %s", tool.Name(), desc))
-		}
+	queryTerms := tokenizeForBM25(input.Query)
+	if len(queryTerms) == 0 {
+		return &types.ToolResult{
+			Error:     fmt.Errorf("search query must contain at least one letter or number"),
+			ToolUseID: toolCtx.ToolUseId,
+		}, nil
+	}
+	limit := input.MaxResults
+	if limit == 0 {
+		limit = defaultToolSearchLimit
+	}
+	if limit < 0 || limit > maxToolSearchLimit {
+		return &types.ToolResult{
+			Error:     fmt.Errorf("max_results must be between 1 and %d", maxToolSearchLimit),
+			ToolUseID: toolCtx.ToolUseId,
+		}, nil
 	}
 
-	if len(results) == 0 {
+	documents := t.buildBM25Documents(ctx)
+	matches := rankBM25Documents(documents, queryTerms)
+	if len(matches) == 0 {
 		return &types.ToolResult{
 			Output:    fmt.Sprintf("No tools found matching '%s'", input.Query),
 			ToolUseID: toolCtx.ToolUseId,
 		}, nil
+	}
+	if limit > len(matches) {
+		limit = len(matches)
+	}
+
+	results := make([]string, 0, limit)
+	for _, match := range matches[:limit] {
+		results = append(results, fmt.Sprintf(
+			"- %s: %s",
+			match.document.tool.Name(),
+			match.document.description,
+		))
 	}
 
 	return &types.ToolResult{
 		Output:    fmt.Sprintf("Tools matching '%s':\n%s", input.Query, strings.Join(results, "\n")),
 		ToolUseID: toolCtx.ToolUseId,
 	}, nil
+}
+
+func (t *ToolSearchTool) buildBM25Documents(ctx context.Context) []bm25ToolDocument {
+	tools := t.registry.ListEnabled()
+	documents := make([]bm25ToolDocument, 0, len(tools))
+	for _, tool := range tools {
+		description, err := tool.Description(ctx, nil, types.ToolOptions{})
+		if err != nil {
+			continue
+		}
+
+		document := bm25ToolDocument{
+			tool:        tool,
+			description: description,
+			terms:       make(map[string]float64),
+		}
+		addBM25Terms(&document, tokenizeForBM25(tool.Name()), 4)
+		for _, alias := range tool.Aliases() {
+			addBM25Terms(&document, tokenizeForBM25(alias), 3)
+		}
+		addBM25Terms(&document, tokenizeForBM25(description), 1)
+
+		schema := tool.InputSchema()
+		propertyNames := make([]string, 0, len(schema.Properties))
+		for name := range schema.Properties {
+			propertyNames = append(propertyNames, name)
+		}
+		sort.Strings(propertyNames)
+		for _, name := range propertyNames {
+			addBM25Terms(&document, tokenizeForBM25(name), 2)
+			if fieldDescription, ok := schema.Properties[name]["description"].(string); ok {
+				addBM25Terms(&document, tokenizeForBM25(fieldDescription), 0.75)
+			}
+		}
+
+		if document.length > 0 {
+			documents = append(documents, document)
+		}
+	}
+	return documents
+}
+
+func addBM25Terms(document *bm25ToolDocument, terms []string, weight float64) {
+	for _, term := range terms {
+		document.terms[term] += weight
+		document.length += weight
+	}
+}
+
+func rankBM25Documents(documents []bm25ToolDocument, queryTerms []string) []bm25ToolMatch {
+	if len(documents) == 0 {
+		return nil
+	}
+
+	documentFrequency := make(map[string]int)
+	for _, document := range documents {
+		for term := range document.terms {
+			documentFrequency[term]++
+		}
+	}
+
+	queryFrequency := make(map[string]int)
+	for _, term := range queryTerms {
+		queryFrequency[term]++
+	}
+
+	var totalLength float64
+	for _, document := range documents {
+		totalLength += document.length
+	}
+	averageLength := totalLength / float64(len(documents))
+
+	matches := make([]bm25ToolMatch, 0, len(documents))
+	for _, document := range documents {
+		var score float64
+		for term, queryCount := range queryFrequency {
+			termFrequency := document.terms[term]
+			if termFrequency == 0 {
+				continue
+			}
+			df := float64(documentFrequency[term])
+			idf := math.Log(1 + (float64(len(documents))-df+0.5)/(df+0.5))
+			lengthNormalization := bm25K1 * (1 - bm25B + bm25B*document.length/averageLength)
+			queryBoost := 1 + math.Log(float64(queryCount))
+			score += idf * (termFrequency * (bm25K1 + 1) / (termFrequency + lengthNormalization)) * queryBoost
+		}
+		if score > 0 {
+			matches = append(matches, bm25ToolMatch{document: document, score: score})
+		}
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		if math.Abs(matches[i].score-matches[j].score) > 1e-12 {
+			return matches[i].score > matches[j].score
+		}
+		return matches[i].document.tool.Name() < matches[j].document.tool.Name()
+	})
+	return matches
+}
+
+func tokenizeForBM25(text string) []string {
+	var terms []string
+	var current []rune
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		term := stemBM25Term(strings.ToLower(string(current)))
+		if term != "" {
+			terms = append(terms, term)
+		}
+		current = current[:0]
+	}
+
+	for _, r := range text {
+		if unicode.Is(unicode.Han, r) {
+			flush()
+			terms = append(terms, string(r))
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			flush()
+			continue
+		}
+		if unicode.IsUpper(r) && len(current) > 0 && unicode.IsLower(current[len(current)-1]) {
+			flush()
+		}
+		current = append(current, unicode.ToLower(r))
+	}
+	flush()
+	return terms
+}
+
+func stemBM25Term(term string) string {
+	switch {
+	case len(term) > 5 && strings.HasSuffix(term, "ies"):
+		return strings.TrimSuffix(term, "ies") + "y"
+	case len(term) > 5 && strings.HasSuffix(term, "ing"):
+		return strings.TrimSuffix(term, "ing")
+	case len(term) > 4 && strings.HasSuffix(term, "ed"):
+		return strings.TrimSuffix(term, "ed")
+	case len(term) > 4 && (strings.HasSuffix(term, "ses") ||
+		strings.HasSuffix(term, "xes") ||
+		strings.HasSuffix(term, "zes") ||
+		strings.HasSuffix(term, "ches") ||
+		strings.HasSuffix(term, "shes")):
+		return strings.TrimSuffix(term, "es")
+	case len(term) > 3 && strings.HasSuffix(term, "s"):
+		return strings.TrimSuffix(term, "s")
+	default:
+		return term
+	}
 }
 
 // =============================================================================
