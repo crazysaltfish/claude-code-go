@@ -27,7 +27,7 @@ type App struct {
 	toolRegistry       *tools.Registry
 	queryEngine        *query.QueryEngine
 	stateManager       *state.StateManager
-	apiClient          *api.Client
+	apiClient          api.MessageClient
 	ctx                context.Context
 	cancel             context.CancelFunc
 	initialPrompt      string
@@ -45,6 +45,7 @@ type Config struct {
 	PermissionMode string
 	Cwd            string
 	MaxTurns       int
+	Provider       string
 	APIKey         string
 	BaseURL        string
 }
@@ -79,10 +80,32 @@ func (a *App) Initialize() error {
 	if err := a.stateManager.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize state: %w", err)
 	}
+	provider := strings.ToLower(strings.TrimSpace(a.config.Provider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(os.Getenv("CLAUDE_API_PROVIDER")))
+	}
+	if provider == "" {
+		provider = "anthropic"
+	}
+	if provider == "openai-compatible" {
+		provider = "openai"
+	}
+	if provider != "anthropic" && provider != "openai" {
+		return fmt.Errorf("unsupported API provider %q (expected anthropic or openai)", provider)
+	}
+	a.config.Provider = provider
+
 	if a.config.Model == "" {
-		a.config.Model = os.Getenv("CLAUDE_MODEL")
+		if provider == "openai" {
+			a.config.Model = os.Getenv("OPENAI_MODEL")
+		} else {
+			a.config.Model = os.Getenv("CLAUDE_MODEL")
+		}
 	}
 	if a.config.Model == "" {
+		if provider == "openai" {
+			return fmt.Errorf("OpenAI provider requires a model via --model or OPENAI_MODEL")
+		}
 		a.config.Model = a.stateManager.GetCurrentModel()
 	}
 	if a.config.PermissionMode == "" {
@@ -108,20 +131,38 @@ func (a *App) Initialize() error {
 	a.toolRegistry = tools.NewToolRegistry()
 	a.registerTools()
 
-	// Initialize API client
-	apiKey := a.config.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	// Initialize the selected provider client.
+	switch provider {
+	case "openai":
+		apiKey := a.config.APIKey
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
+		baseURL := a.config.BaseURL
+		if baseURL == "" {
+			baseURL = os.Getenv("OPENAI_BASE_URL")
+		}
+		a.apiClient = api.NewOpenAIClient(api.Config{
+			APIKey:       apiKey,
+			BaseURL:      baseURL,
+			Organization: os.Getenv("OPENAI_ORGANIZATION"),
+			Project:      os.Getenv("OPENAI_PROJECT"),
+		})
+	default:
+		apiKey := a.config.APIKey
+		if apiKey == "" {
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		}
+		baseURL := a.config.BaseURL
+		if baseURL == "" {
+			baseURL = os.Getenv("ANTHROPIC_BASE_URL")
+		}
+		a.apiClient = api.NewClient(api.Config{
+			APIKey:    apiKey,
+			AuthToken: os.Getenv("ANTHROPIC_AUTH_TOKEN"),
+			BaseURL:   baseURL,
+		})
 	}
-	baseURL := a.config.BaseURL
-	if baseURL == "" {
-		baseURL = os.Getenv("ANTHROPIC_BASE_URL")
-	}
-	a.apiClient = api.NewClient(api.Config{
-		APIKey:    apiKey,
-		AuthToken: os.Getenv("ANTHROPIC_AUTH_TOKEN"),
-		BaseURL:   baseURL,
-	})
 
 	// Initialize query engine
 	queryConfig := query.QueryEngineConfig{

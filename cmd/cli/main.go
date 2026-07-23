@@ -18,6 +18,8 @@ var (
 	verboseFlag    bool
 	printModeFlag  bool
 	modelFlag      string
+	providerFlag   string
+	baseURLFlag    string
 	permissionFlag string
 	maxTurnsFlag   int
 )
@@ -51,7 +53,9 @@ func init() {
 	rootCmd.Flags().BoolVarP(&debugFlag, "debug", "d", false, "Enable debug mode")
 	rootCmd.Flags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose output")
 	rootCmd.Flags().BoolVarP(&printModeFlag, "print", "p", false, "Print mode (non-interactive)")
-	rootCmd.Flags().StringVarP(&modelFlag, "model", "m", "", "Model to use (e.g., claude-sonnet-4-20250514)")
+	rootCmd.Flags().StringVarP(&modelFlag, "model", "m", "", "Model to use")
+	rootCmd.Flags().StringVar(&providerFlag, "provider", "", "API provider: anthropic or openai")
+	rootCmd.Flags().StringVar(&baseURLFlag, "base-url", "", "Override the provider API base URL")
 	rootCmd.Flags().StringVar(&permissionFlag, "permission-mode", "", "Permission mode (default, acceptEdits, bypassPermissions)")
 	rootCmd.Flags().IntVar(&maxTurnsFlag, "max-turns", 100, "Maximum number of conversation turns")
 
@@ -104,6 +108,8 @@ func runMain(cmd *cobra.Command, args []string) {
 		Verbose:        verboseFlag,
 		PrintMode:      printModeFlag,
 		Model:          modelFlag,
+		Provider:       providerFlag,
+		BaseURL:        baseURLFlag,
 		PermissionMode: permissionFlag,
 		MaxTurns:       maxTurnsFlag,
 	}

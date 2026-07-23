@@ -37,7 +37,7 @@ type QueryEngineConfig struct {
 	MaxBudgetUsd       float64
 	Verbose            bool
 	AbortController    *types.AbortController
-	APIClient          *api.Client // API client for Claude API calls
+	APIClient          api.MessageClient
 }
 
 // QueryEngine owns the query lifecycle and session state for a conversation.
@@ -451,7 +451,7 @@ func (e *QueryEngine) convertToolsForAPI() []api.ToolDefinition {
 	return tools
 }
 
-// callAPI calls the Anthropic API using the configured client.
+// callAPI calls the configured provider through the canonical message client.
 func (e *QueryEngine) callAPI(ctx context.Context, req api.MessageRequest) (*api.MessageResponse, error) {
 	if e.config.APIClient == nil {
 		return nil, fmt.Errorf("API client not configured")

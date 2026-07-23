@@ -2,6 +2,7 @@ package components
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -72,20 +73,25 @@ func (m *InputModel) Update(msg tea.Msg) tea.Cmd {
 		switch msg.Type {
 		case tea.KeyBackspace:
 			if m.CursorPos > 0 {
-				m.Value = m.Value[:m.CursorPos-1] + m.Value[m.CursorPos:]
-				m.CursorPos--
+				_, size := utf8.DecodeLastRuneInString(m.Value[:m.CursorPos])
+				start := m.CursorPos - size
+				m.Value = m.Value[:start] + m.Value[m.CursorPos:]
+				m.CursorPos = start
 			}
 		case tea.KeyDelete:
 			if m.CursorPos < len(m.Value) {
-				m.Value = m.Value[:m.CursorPos] + m.Value[m.CursorPos+1:]
+				_, size := utf8.DecodeRuneInString(m.Value[m.CursorPos:])
+				m.Value = m.Value[:m.CursorPos] + m.Value[m.CursorPos+size:]
 			}
 		case tea.KeyLeft:
 			if m.CursorPos > 0 {
-				m.CursorPos--
+				_, size := utf8.DecodeLastRuneInString(m.Value[:m.CursorPos])
+				m.CursorPos -= size
 			}
 		case tea.KeyRight:
 			if m.CursorPos < len(m.Value) {
-				m.CursorPos++
+				_, size := utf8.DecodeRuneInString(m.Value[m.CursorPos:])
+				m.CursorPos += size
 			}
 		case tea.KeyHome:
 			m.CursorPos = 0
@@ -113,7 +119,15 @@ func (m *InputModel) Update(msg tea.Msg) tea.Cmd {
 			// Insert character at cursor position
 			runes := msg.Runes
 			m.Value = m.Value[:m.CursorPos] + string(runes) + m.Value[m.CursorPos:]
-			m.CursorPos += len(runes)
+			m.CursorPos += len(string(runes))
+		case tea.KeySpace:
+			// Bubble Tea emits a dedicated KeySpace event instead of KeyRunes.
+			space := string(msg.Runes)
+			if space == "" {
+				space = " "
+			}
+			m.Value = m.Value[:m.CursorPos] + space + m.Value[m.CursorPos:]
+			m.CursorPos += len(space)
 		}
 	}
 
@@ -137,8 +151,9 @@ func (m *InputModel) View() string {
 		atCursor := " "
 		after := ""
 		if m.CursorPos < len(m.Value) {
-			atCursor = string(m.Value[m.CursorPos])
-			after = m.Value[m.CursorPos+1:]
+			r, size := utf8.DecodeRuneInString(m.Value[m.CursorPos:])
+			atCursor = string(r)
+			after = m.Value[m.CursorPos+size:]
 		}
 
 		b.WriteString(before + cursorStyle.Render(atCursor) + after)

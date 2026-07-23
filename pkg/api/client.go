@@ -13,7 +13,16 @@ import (
 	"time"
 )
 
-// Client is the Anthropic API client.
+// MessageClient is the provider-neutral interface used by the query engine.
+// Implementations translate the canonical Anthropic-style message structures
+// in this package to the provider's wire protocol.
+type MessageClient interface {
+	CreateMessage(context.Context, MessageRequest) (*MessageResponse, error)
+	StreamMessage(context.Context, MessageRequest, func(StreamEvent) error) error
+	CountTokens(context.Context, MessageRequest) (int, error)
+}
+
+// Client is the Anthropic Messages API client.
 type Client struct {
 	apiKey     string
 	authToken  string
@@ -24,12 +33,14 @@ type Client struct {
 
 // Config contains client configuration.
 type Config struct {
-	APIKey     string
-	AuthToken  string
-	BaseURL    string
-	MaxRetries int
-	Timeout    time.Duration
-	MaxTokens  int
+	APIKey       string
+	AuthToken    string
+	BaseURL      string
+	Organization string
+	Project      string
+	MaxRetries   int
+	Timeout      time.Duration
+	MaxTokens    int
 }
 
 // NewClient creates a new API client.
@@ -130,11 +141,12 @@ type Usage struct {
 
 // StreamEvent represents a streaming event.
 type StreamEvent struct {
-	Type    string           `json:"type"`
-	Index   int              `json:"index,omitempty"`
-	Delta   *EventDelta      `json:"delta,omitempty"`
-	Message *MessageResponse `json:"message,omitempty"`
-	Usage   *Usage           `json:"usage,omitempty"`
+	Type         string           `json:"type"`
+	Index        int              `json:"index,omitempty"`
+	Delta        *EventDelta      `json:"delta,omitempty"`
+	ContentBlock *ContentBlock    `json:"content_block,omitempty"`
+	Message      *MessageResponse `json:"message,omitempty"`
+	Usage        *Usage           `json:"usage,omitempty"`
 }
 
 // EventDelta contains the delta for streaming events.
