@@ -246,7 +246,7 @@ func (a *App) runInteractiveMode() error {
 	model.SetPermissionRequests(a.permissionRequests)
 
 	// Create and run the tea program
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// Handle UI events in a goroutine
 	go func() {

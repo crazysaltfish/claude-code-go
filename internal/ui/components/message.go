@@ -231,21 +231,21 @@ func wrapText(text string, width int) string {
 
 // MessageListModel represents a list of messages.
 type MessageListModel struct {
-	Messages   []MessageModel
-	ScrollPos  int
-	MaxVisible int
-	Width      int
-	Height     int
+	Messages     []MessageModel
+	ScrollOffset int
+	MaxVisible   int
+	Width        int
+	Height       int
 }
 
 // NewMessageList creates a new message list.
 func NewMessageList(width, height int) *MessageListModel {
 	return &MessageListModel{
-		Messages:   []MessageModel{},
-		ScrollPos:  0,
-		MaxVisible: height - 4, // Reserve space for input
-		Width:      width,
-		Height:     height,
+		Messages:     []MessageModel{},
+		ScrollOffset: 0,
+		MaxVisible:   height - 4, // Reserve space for input
+		Width:        width,
+		Height:       height,
 	}
 }
 
@@ -253,52 +253,98 @@ func NewMessageList(width, height int) *MessageListModel {
 func (m *MessageListModel) AddMessage(msg MessageModel) {
 	m.Messages = append(m.Messages, msg)
 	// Auto-scroll to bottom
-	m.ScrollPos = len(m.Messages) - 1
+	m.ScrollOffset = 0
 }
 
-// ScrollUp scrolls the list up.
+// ScrollUp scrolls the rendered conversation up by one line.
 func (m *MessageListModel) ScrollUp() {
-	if m.ScrollPos > 0 {
-		m.ScrollPos--
+	maxOffset := m.maxScrollOffset()
+	if m.ScrollOffset < maxOffset {
+		m.ScrollOffset++
 	}
 }
 
-// ScrollDown scrolls the list down.
+// ScrollDown scrolls the rendered conversation down by one line.
 func (m *MessageListModel) ScrollDown() {
-	if m.ScrollPos < len(m.Messages)-1 {
-		m.ScrollPos++
+	if m.ScrollOffset > 0 {
+		m.ScrollOffset--
 	}
 }
 
-// View renders the message list.
+// PageUp scrolls upward by one viewport.
+func (m *MessageListModel) PageUp() {
+	step := m.MaxVisible - 1
+	if step < 1 {
+		step = 1
+	}
+	m.ScrollOffset += step
+	maxOffset := m.maxScrollOffset()
+	if m.ScrollOffset > maxOffset {
+		m.ScrollOffset = maxOffset
+	}
+}
+
+// PageDown scrolls downward by one viewport.
+func (m *MessageListModel) PageDown() {
+	step := m.MaxVisible - 1
+	if step < 1 {
+		step = 1
+	}
+	m.ScrollOffset -= step
+	if m.ScrollOffset < 0 {
+		m.ScrollOffset = 0
+	}
+}
+
+// IsScrolled reports whether the viewport is above the latest messages.
+func (m *MessageListModel) IsScrolled() bool {
+	return m.ScrollOffset > 0
+}
+
+// View renders the message list as a fixed-height, line-based viewport.
 func (m *MessageListModel) View() string {
+	height := m.MaxVisible
+	if height < 1 {
+		height = 1
+	}
+	lines := m.renderedLines()
+	maxOffset := len(lines) - height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.ScrollOffset > maxOffset {
+		m.ScrollOffset = maxOffset
+	}
+
+	end := len(lines) - m.ScrollOffset
+	start := end - height
+	if start < 0 {
+		start = 0
+	}
+	visible := append([]string(nil), lines[start:end]...)
+	for len(visible) < height {
+		visible = append(visible, "")
+	}
+	return strings.Join(visible, "\n") + "\n"
+}
+
+func (m *MessageListModel) renderedLines() []string {
+	if len(m.Messages) == 0 {
+		return nil
+	}
 	var b strings.Builder
-
-	// Calculate visible range
-	start := 0
-	if len(m.Messages) > m.MaxVisible {
-		start = len(m.Messages) - m.MaxVisible
-		if m.ScrollPos < start {
-			start = m.ScrollPos
-		}
-	}
-	end := start + m.MaxVisible
-	if end > len(m.Messages) {
-		end = len(m.Messages)
-	}
-
-	// Render visible messages
-	for i := start; i < end; i++ {
-		msg := m.Messages[i]
+	for _, msg := range m.Messages {
 		b.WriteString(RenderMessage(msg, m.Width))
 		b.WriteString("\n")
 	}
+	rendered := strings.TrimSuffix(b.String(), "\n")
+	return strings.Split(rendered, "\n")
+}
 
-	// Fill remaining space
-	linesUsed := strings.Count(b.String(), "\n")
-	for i := linesUsed; i < m.MaxVisible; i++ {
-		b.WriteString("\n")
+func (m *MessageListModel) maxScrollOffset() int {
+	maxOffset := len(m.renderedLines()) - m.MaxVisible
+	if maxOffset < 0 {
+		return 0
 	}
-
-	return b.String()
+	return maxOffset
 }

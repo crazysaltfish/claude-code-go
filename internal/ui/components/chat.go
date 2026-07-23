@@ -98,6 +98,14 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case tea.KeyCtrlH:
 			m.HelpVisible = !m.HelpVisible
+		case tea.KeyPgUp:
+			m.Messages.PageUp()
+		case tea.KeyPgDown:
+			m.Messages.PageDown()
+		case tea.KeyCtrlUp:
+			m.Messages.ScrollUp()
+		case tea.KeyCtrlDown:
+			m.Messages.ScrollDown()
 		case tea.KeyEnter:
 			if m.State == ChatStateIdle && m.Input.Value != "" {
 				// Add user message
@@ -111,6 +119,17 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			if m.State == ChatStateIdle {
 				m.Input.Update(msg)
+			}
+		}
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			for i := 0; i < 3; i++ {
+				m.Messages.ScrollUp()
+			}
+		case tea.MouseButtonWheelDown:
+			for i := 0; i < 3; i++ {
+				m.Messages.ScrollDown()
 			}
 		}
 	}
@@ -153,11 +172,16 @@ func (m *ChatModel) View() string {
 	b.WriteString(m.Input.View() + "\n")
 
 	// Footer with help
-	footerText := "Ctrl+C: quit | Ctrl+H: help | Enter: send"
+	footerText := "Enter: send | PgUp/PgDn: history | Ctrl+C: quit | Ctrl+H: help"
 	if m.ApprovalText != "" {
 		footerText = "↑↓: inspect call | y: allow once | n/Esc: deny | Ctrl+C: quit"
+	} else if m.Messages.IsScrolled() {
+		footerText = fmt.Sprintf(
+			"History: %d lines above latest | PgUp/PgDn or mouse wheel | Enter: send",
+			m.Messages.ScrollOffset,
+		)
 	} else if m.HelpVisible {
-		footerText = "↑↓: scroll | Ctrl+C: quit | Ctrl+H: hide help | Enter: send"
+		footerText = "↑↓: input history | PgUp/PgDn: chat history | mouse wheel: scroll | Ctrl+H: hide help"
 	}
 	b.WriteString(chatFooterStyle.Render(footerText))
 

@@ -27,7 +27,8 @@ var (
 				Foreground(lipgloss.Color("243"))
 
 	cursorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("86")).
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("86")).
 			Bold(true)
 
 	multilineHintStyle = lipgloss.NewStyle().
@@ -143,8 +144,8 @@ func (m *InputModel) View() string {
 
 	// Render value with cursor
 	if m.Value == "" {
-		// Show placeholder
-		b.WriteString(placeholderStyle.Render(m.Placeholder))
+		// Keep a visible block cursor even before the first character.
+		b.WriteString(cursorStyle.Render(" ") + placeholderStyle.Render(m.Placeholder))
 	} else {
 		// Show value with cursor
 		before := m.Value[:m.CursorPos]

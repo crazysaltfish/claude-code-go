@@ -1,10 +1,24 @@
 package components
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
+
+func TestInputModelUsesVisibleBlockCursor(t *testing.T) {
+	if _, noColor := cursorStyle.GetBackground().(lipgloss.NoColor); noColor {
+		t.Fatal("cursor must have a background color")
+	}
+
+	input := NewInput(">", "Type your message...", 80)
+	view := input.View()
+	if !containsAll(view, ">", "Type your message...") {
+		t.Fatalf("empty input did not render cursor context and placeholder:\n%s", view)
+	}
+}
 
 func TestInputModelAcceptsSpaceKey(t *testing.T) {
 	input := NewInput(">", "", 80)
@@ -63,4 +77,13 @@ func TestInputModelKeepsByteCursorValidForUnicodeRunes(t *testing.T) {
 	if input.Value != "你好 word" {
 		t.Fatalf("Unicode-aware editing produced %q", input.Value)
 	}
+}
+
+func containsAll(value string, parts ...string) bool {
+	for _, part := range parts {
+		if !strings.Contains(value, part) {
+			return false
+		}
+	}
+	return true
 }
