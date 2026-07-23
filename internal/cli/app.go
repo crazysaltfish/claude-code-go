@@ -13,6 +13,7 @@ import (
 
 	"claude-code-go/internal/commands"
 	"claude-code-go/internal/query"
+	"claude-code-go/internal/state"
 	"claude-code-go/internal/tools"
 	"claude-code-go/internal/types"
 	"claude-code-go/internal/ui"
@@ -21,16 +22,18 @@ import (
 
 // App represents the CLI application.
 type App struct {
-	config        *Config
-	registry      *commands.Registry
-	toolRegistry  *tools.Registry
-	queryEngine   *query.QueryEngine
-	uiModel       *ui.Model
-	apiClient     *api.Client
-	ctx           context.Context
-	cancel        context.CancelFunc
-	initialPrompt string
-	version       string
+	config             *Config
+	registry           *commands.Registry
+	toolRegistry       *tools.Registry
+	queryEngine        *query.QueryEngine
+	stateManager       *state.StateManager
+	apiClient          *api.Client
+	ctx                context.Context
+	cancel             context.CancelFunc
+	initialPrompt      string
+	version            string
+	permissionRequests chan ui.PermissionRequest
+	permissionUI       bool
 }
 
 // Config holds CLI configuration.
@@ -51,10 +54,11 @@ func NewApp(config *Config, version string) *App {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &App{
-		config:  config,
-		ctx:     ctx,
-		cancel:  cancel,
-		version: version,
+		config:             config,
+		ctx:                ctx,
+		cancel:             cancel,
+		version:            version,
+		permissionRequests: make(chan ui.PermissionRequest),
 	}
 }
 
@@ -69,6 +73,32 @@ func (a *App) Initialize() error {
 			return fmt.Errorf("failed to get working directory: %w", err)
 		}
 	}
+	a.config.Cwd = cwd
+
+	a.stateManager = state.NewStateManager()
+	if err := a.stateManager.Initialize(); err != nil {
+		return fmt.Errorf("failed to initialize state: %w", err)
+	}
+	if a.config.Model == "" {
+		a.config.Model = os.Getenv("CLAUDE_MODEL")
+	}
+	if a.config.Model == "" {
+		a.config.Model = a.stateManager.GetCurrentModel()
+	}
+	if a.config.PermissionMode == "" {
+		a.config.PermissionMode = os.Getenv("CLAUDE_PERMISSION_MODE")
+	}
+	if a.config.PermissionMode == "" {
+		a.config.PermissionMode = a.stateManager.GetPermissionMode()
+	}
+	if a.config.PermissionMode != "" && !isExternalPermissionMode(types.PermissionMode(a.config.PermissionMode)) {
+		return fmt.Errorf("invalid permission mode: %s", a.config.PermissionMode)
+	}
+	if permissionFlag := a.config.PermissionMode; permissionFlag != "" && permissionFlag != a.stateManager.GetPermissionMode() {
+		if err := a.stateManager.SetPermissionMode(permissionFlag); err != nil {
+			return fmt.Errorf("failed to persist permission mode: %w", err)
+		}
+	}
 
 	// Initialize command registry
 	a.registry = commands.NewRegistry()
@@ -79,20 +109,37 @@ func (a *App) Initialize() error {
 	a.registerTools()
 
 	// Initialize API client
+	apiKey := a.config.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	baseURL := a.config.BaseURL
+	if baseURL == "" {
+		baseURL = os.Getenv("ANTHROPIC_BASE_URL")
+	}
 	a.apiClient = api.NewClient(api.Config{
-		APIKey:  a.config.APIKey,
-		BaseURL: a.config.BaseURL,
+		APIKey:    apiKey,
+		AuthToken: os.Getenv("ANTHROPIC_AUTH_TOKEN"),
+		BaseURL:   baseURL,
 	})
 
 	// Initialize query engine
 	queryConfig := query.QueryEngineConfig{
-		Cwd:       cwd,
-		Tools:     a.toolRegistry.List(),
-		MaxTurns:  a.config.MaxTurns,
-		APIClient: a.apiClient,
+		SessionID:  a.stateManager.GetSessionID(),
+		Cwd:        cwd,
+		Tools:      a.toolRegistry.ListEnabled(),
+		MaxTurns:   a.config.MaxTurns,
+		APIClient:  a.apiClient,
+		CanUseTool: a.canUseTool,
 		GetAppState: func() *types.AppState {
 			return &types.AppState{
 				MainLoopModel: a.config.Model,
+				Settings: types.SettingsJson{
+					PermissionMode: a.config.PermissionMode,
+				},
+				ToolPermissionContext: types.ToolPermissionContext{
+					Mode: types.PermissionMode(a.config.PermissionMode),
+				},
 			}
 		},
 	}
@@ -131,7 +178,7 @@ func (a *App) runPrintMode() error {
 	}
 
 	// Process the prompt
-	output, err := a.queryEngine.SubmitMessage(a.ctx, a.initialPrompt)
+	output, err := a.submitInteractiveInput(a.ctx, a.initialPrompt)
 	if err != nil {
 		return fmt.Errorf("failed to process prompt: %w", err)
 	}
@@ -151,21 +198,14 @@ func (a *App) runPrintMode() error {
 
 // runInteractiveMode runs the interactive UI.
 func (a *App) runInteractiveMode() error {
-	// Initialize UI model
-	model := ui.InitialModel()
-	a.uiModel = &model
-
-	// Add welcome message
-	a.uiModel.AddMessage("assistant", "Welcome to Claude Code! How can I help you today?")
-
-	// Add initial prompt if provided
-	if a.initialPrompt != "" {
-		a.uiModel.AddMessage("user", a.initialPrompt)
-		go a.processUserInput(a.initialPrompt)
-	}
+	a.permissionUI = true
+	defer func() { a.permissionUI = false }()
+	model := ui.NewAppModelWithContext(a.ctx, a.submitInteractiveInput, 80, 24)
+	model.SetInitialPrompt(a.initialPrompt)
+	model.SetPermissionRequests(a.permissionRequests)
 
 	// Create and run the tea program
-	p := tea.NewProgram(a.uiModel, tea.WithAltScreen())
+	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	// Handle UI events in a goroutine
 	go func() {
@@ -185,114 +225,124 @@ func (a *App) runInteractiveMode() error {
 	}
 
 	// Handle final state
-	if m, ok := finalModel.(ui.Model); ok {
-		if m.Err != nil {
-			return m.Err
-		}
-	}
+	_ = finalModel
 
 	return nil
 }
 
-// processUserInput handles user input.
-func (a *App) processUserInput(input string) {
-	// Check for slash commands
-	if strings.HasPrefix(input, "/") {
-		cmdName, args := commands.ParseCommand(input)
-		cmd, ok := a.registry.Get(cmdName)
-		if ok {
-			ctx := &commands.CommandContext{
-				Cwd:           a.config.Cwd,
-				Args:          args,
-				IsInteractive: !a.config.PrintMode,
-				Verbose:       a.config.Verbose,
-			}
+// submitInteractiveInput executes local slash commands or submits a model query.
+func (a *App) submitInteractiveInput(ctx context.Context, input string) (<-chan interface{}, error) {
+	if !strings.HasPrefix(input, "/") {
+		return a.queryEngine.SubmitMessage(ctx, input)
+	}
 
-			result, err := cmd.Execute(a.ctx, args, ctx)
-			if err != nil {
-				a.uiModel.AddMessage("system", fmt.Sprintf("Error: %v", err))
-				return
-			}
+	cmdName, args := commands.ParseCommand(input)
+	cmd, ok := a.registry.Get(cmdName)
+	if !ok {
+		return a.queryEngine.SubmitMessage(ctx, input)
+	}
 
-			if result.Type == "text" {
-				a.uiModel.AddMessage("system", result.Value)
-			}
+	output := make(chan interface{}, 1)
+	go func() {
+		defer close(output)
+		result, err := cmd.Execute(ctx, args, &commands.CommandContext{
+			Cwd:           a.config.Cwd,
+			Args:          args,
+			IsInteractive: a.permissionUI,
+			Verbose:       a.config.Verbose,
+			Debug:         a.config.Debug,
+		})
+		if err != nil {
+			output <- query.SDKMessage{Type: "system", Message: map[string]interface{}{
+				"subtype": "error",
+				"error":   err.Error(),
+			}}
 			return
 		}
-	}
-
-	// Process as a query
-	output, err := a.queryEngine.SubmitMessage(a.ctx, input)
-	if err != nil {
-		a.uiModel.AddMessage("system", fmt.Sprintf("Error: %v", err))
-		return
-	}
-
-	// Process results
-	for msg := range output {
-		switch m := msg.(type) {
-		case query.SDKMessage:
-			a.handleSDKMessage(m)
-		case query.ResultMessage:
-			a.handleResultMessage(m)
+		if result != nil && result.Value != "" {
+			if cmdName == "model" && strings.HasPrefix(result.Value, "Model set to:") {
+				a.config.Model = strings.TrimSpace(strings.TrimPrefix(result.Value, "Model set to:"))
+				a.queryEngine.SetModel(a.config.Model)
+				if err := a.stateManager.SetCurrentModel(a.config.Model); err != nil {
+					output <- query.SDKMessage{Type: "system", Message: map[string]interface{}{
+						"subtype": "error",
+						"error":   fmt.Sprintf("model changed but could not be persisted: %v", err),
+					}}
+					return
+				}
+			}
+			output <- query.SDKMessage{Type: "system", Message: map[string]interface{}{
+				"subtype": "message",
+				"content": result.Value,
+			}}
 		}
+	}()
+	return output, nil
+}
+
+func (a *App) canUseTool(ctx context.Context, toolName string, input json.RawMessage) (*types.PermissionDecision, error) {
+	tool, ok := a.toolRegistry.Get(toolName)
+	if !ok {
+		return &types.PermissionDecision{Behavior: types.PermissionBehaviorDeny, Message: "unknown tool"}, nil
+	}
+
+	mode := types.PermissionMode(a.config.PermissionMode)
+	if mode == "" {
+		mode = types.PermissionModeDefault
+	}
+	if mode == types.PermissionModeBypassPermissions {
+		return &types.PermissionDecision{Behavior: types.PermissionBehaviorAllow}, nil
+	}
+	if tool.IsReadOnly(input) {
+		return &types.PermissionDecision{Behavior: types.PermissionBehaviorAllow}, nil
+	}
+	if mode == types.PermissionModeAcceptEdits {
+		switch tool.Name() {
+		case "Write", "Edit", "MultiEdit", "NotebookEdit":
+			return &types.PermissionDecision{Behavior: types.PermissionBehaviorAllow}, nil
+		}
+	}
+	if mode == types.PermissionModePlan || mode == types.PermissionModeDontAsk {
+		return &types.PermissionDecision{Behavior: types.PermissionBehaviorDeny, Message: fmt.Sprintf("tool %s is not allowed in %s mode", tool.Name(), mode)}, nil
+	}
+	if !a.permissionUI {
+		return &types.PermissionDecision{
+			Behavior: types.PermissionBehaviorDeny,
+			Message:  fmt.Sprintf("tool %s requires approval and cannot run in print mode", tool.Name()),
+		}, nil
+	}
+
+	response := make(chan bool, 1)
+	request := ui.PermissionRequest{
+		ToolName:    tool.Name(),
+		Input:       append(json.RawMessage(nil), input...),
+		ReadOnly:    tool.IsReadOnly(input),
+		Destructive: tool.IsDestructive(input),
+		Response:    response,
+	}
+	select {
+	case a.permissionRequests <- request:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case allowed := <-response:
+		if allowed {
+			return &types.PermissionDecision{Behavior: types.PermissionBehaviorAllow}, nil
+		}
+		return &types.PermissionDecision{Behavior: types.PermissionBehaviorDeny, Message: fmt.Sprintf("user denied tool %s", tool.Name())}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-// handleSDKMessage handles SDK messages.
-func (a *App) handleSDKMessage(msg query.SDKMessage) {
-	switch msg.Type {
-	case "user":
-		// User message already displayed
-	case "assistant":
-		// Handle assistant response
-		if response, ok := msg.Message.(*types.Message); ok {
-			a.uiModel.AddMessage("assistant", string(response.Content))
-		} else if responseMap, ok := msg.Message.(map[string]interface{}); ok {
-			if content, ok := responseMap["content"]; ok {
-				if contentSlice, ok := content.([]interface{}); ok {
-					var textParts []string
-					for _, c := range contentSlice {
-						if cMap, ok := c.(map[string]interface{}); ok {
-							if text, ok := cMap["text"].(string); ok {
-								textParts = append(textParts, text)
-							}
-						}
-					}
-					a.uiModel.AddMessage("assistant", strings.Join(textParts, "\n"))
-				}
-			}
-		}
-	case "tool_result":
-		// Tool result
-		if m, ok := msg.Message.(map[string]interface{}); ok {
-			toolName, _ := m["tool_name"].(string)
-			content, _ := m["content"].(string)
-			a.uiModel.AddMessage("system", fmt.Sprintf("[Tool: %s]\n%s", toolName, content))
-		}
-	case "system":
-		// System message
-		if m, ok := msg.Message.(map[string]interface{}); ok {
-			if subtype, ok := m["subtype"].(string); ok {
-				switch subtype {
-				case "error":
-					errMsg, _ := m["error"].(string)
-					a.uiModel.AddMessage("system", fmt.Sprintf("Error: %s", errMsg))
-				case "interrupted":
-					a.uiModel.AddMessage("system", "Operation interrupted")
-				}
-			}
+func isExternalPermissionMode(mode types.PermissionMode) bool {
+	for _, candidate := range types.ExternalPermissionModes {
+		if mode == candidate {
+			return true
 		}
 	}
-}
-
-// handleResultMessage handles result messages.
-func (a *App) handleResultMessage(msg query.ResultMessage) {
-	if msg.IsError {
-		a.uiModel.AddMessage("system", fmt.Sprintf("Error: %s (subtype: %s)", msg.Result, msg.Subtype))
-	} else {
-		a.uiModel.AddMessage("system", fmt.Sprintf("Completed in %d turns, %.2fs", msg.NumTurns, float64(msg.DurationMs)/1000))
-	}
+	return false
 }
 
 // printSDKMessage prints an SDK message in print mode.
@@ -345,19 +395,15 @@ func (a *App) RunWithPrompt(prompt string) (string, error) {
 		return "", err
 	}
 
-	var results []string
+	var result string
+	var resultErr error
 	for msg := range output {
-		switch m := msg.(type) {
-		case query.ResultMessage:
-			results = append(results, m.Result)
-		case query.SDKMessage:
-			if m.Type == "assistant" {
-				if response, ok := m.Message.(*types.Message); ok {
-					results = append(results, string(response.Content))
-				}
+		if m, ok := msg.(query.ResultMessage); ok {
+			result = m.Result
+			if m.IsError {
+				resultErr = fmt.Errorf("query failed: %s: %s", m.Subtype, m.Result)
 			}
 		}
 	}
-
-	return strings.Join(results, "\n"), nil
+	return result, resultErr
 }

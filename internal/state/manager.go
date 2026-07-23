@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"claude-code-go/internal/utils"
 )
@@ -17,8 +18,6 @@ import (
 
 // AppState represents the global application state.
 type AppState struct {
-	mu sync.RWMutex `json:"-"`
-
 	// Session info
 	SessionID    string `json:"session_id"`
 	SessionStart int64  `json:"session_start"`
@@ -79,17 +78,23 @@ func (sm *StateManager) Initialize() error {
 	cacheDir := utils.GetClaudeCacheHome()
 	sm.path = filepath.Join(cacheDir, "state.json")
 
-	// Initialize session
+	// Load existing state if available
+	if err := sm.load(); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to load state: %w", err)
+	}
+
+	// Initialize fields that were not present in persisted state.
 	if sm.state.SessionID == "" {
 		sm.state.SessionID = utils.GenerateUUID()
 	}
 	if sm.state.SessionStart == 0 {
-		sm.state.SessionStart = 0 // TODO: Use time.Now().Unix()
+		sm.state.SessionStart = time.Now().Unix()
 	}
-
-	// Load existing state if available
-	if err := sm.load(); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to load state: %w", err)
+	if sm.state.Features == nil {
+		sm.state.Features = make(map[string]bool)
+	}
+	if sm.state.Custom == nil {
+		sm.state.Custom = make(map[string]interface{})
 	}
 
 	return nil
@@ -154,6 +159,13 @@ func (sm *StateManager) GetCwd() string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.state.Cwd
+}
+
+// GetPermissionMode returns the current permission mode.
+func (sm *StateManager) GetPermissionMode() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.state.PermissionMode
 }
 
 // GetFeature returns a feature flag.

@@ -1,25 +1,31 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
 // Client is the Anthropic API client.
 type Client struct {
 	apiKey     string
+	authToken  string
 	baseURL    string
 	httpClient *http.Client
+	maxRetries int
 }
 
 // Config contains client configuration.
 type Config struct {
 	APIKey     string
+	AuthToken  string
 	BaseURL    string
 	MaxRetries int
 	Timeout    time.Duration
@@ -37,13 +43,19 @@ func NewClient(config Config) *Client {
 	if timeout == 0 {
 		timeout = 60 * time.Second
 	}
+	maxRetries := config.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = 2
+	}
 
 	return &Client{
-		apiKey:  config.APIKey,
-		baseURL: baseURL,
+		apiKey:    config.APIKey,
+		authToken: config.AuthToken,
+		baseURL:   baseURL,
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
+		maxRetries: maxRetries,
 	}
 }
 
@@ -77,6 +89,7 @@ type ContentBlock struct {
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   interface{}     `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
 
 	// For thinking
 	Thinking string `json:"thinking,omitempty"`
@@ -142,45 +155,95 @@ func (c *Client) CreateMessage(ctx context.Context, req MessageRequest) (*Messag
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/messages", bytes.NewReader(body))
+	for attempt := 0; ; attempt++ {
+		httpReq, err := c.newMessageRequest(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			if attempt < c.maxRetries {
+				if err := waitForRetry(ctx, retryDelay(attempt, "")); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read response: %w", readErr)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var result MessageResponse
+			if err := json.Unmarshal(respBody, &result); err != nil {
+				return nil, fmt.Errorf("failed to parse response: %w", err)
+			}
+			return &result, nil
+		}
+
+		if attempt < c.maxRetries && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
+			if err := waitForRetry(ctx, retryDelay(attempt, resp.Header.Get("Retry-After"))); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		return nil, parseAPIError(resp.Status, respBody)
+	}
+}
+
+func (c *Client) newMessageRequest(ctx context.Context, body []byte) (*http.Request, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", c.apiKey)
+	if c.authToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
+	} else if c.apiKey != "" {
+		httpReq.Header.Set("x-api-key", c.apiKey)
+	}
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	return httpReq, nil
+}
 
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+func parseAPIError(status string, body []byte) error {
+	var apiErr struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error.Message != "" {
+		return fmt.Errorf("API error: %s - %s", apiErr.Error.Type, apiErr.Error.Message)
 	}
+	return fmt.Errorf("API error: %s", status)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		var apiErr struct {
-			Error struct {
-				Type    string `json:"type"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(respBody, &apiErr); err == nil {
-			return nil, fmt.Errorf("API error: %s - %s", apiErr.Error.Type, apiErr.Error.Message)
-		}
-		return nil, fmt.Errorf("API error: %s", resp.Status)
+func retryDelay(attempt int, retryAfter string) time.Duration {
+	if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
 	}
-
-	var result MessageResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	delay := time.Duration(1<<uint(attempt)) * 500 * time.Millisecond
+	if delay > 8*time.Second {
+		return 8 * time.Second
 	}
+	return delay
+}
 
-	return &result, nil
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // StreamMessage sends a message request with streaming.
@@ -198,7 +261,11 @@ func (c *Client) StreamMessage(ctx context.Context, req MessageRequest, onEvent 
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", c.apiKey)
+	if c.authToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
+	} else if c.apiKey != "" {
+		httpReq.Header.Set("x-api-key", c.apiKey)
+	}
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -212,23 +279,30 @@ func (c *Client) StreamMessage(ctx context.Context, req MessageRequest, onEvent 
 		return fmt.Errorf("API error: %s - %s", resp.Status, string(respBody))
 	}
 
-	decoder := json.NewDecoder(resp.Body)
-	for {
-		var event StreamEvent
-		if err := decoder.Decode(&event); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("failed to decode event: %w", err)
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
 		}
-
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event StreamEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return fmt.Errorf("failed to decode stream event: %w", err)
+		}
 		if event.Type == "message_stop" {
 			break
 		}
-
 		if err := onEvent(event); err != nil {
 			return err
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed to read stream: %w", err)
 	}
 
 	return nil
@@ -250,7 +324,11 @@ func (c *Client) CountTokens(ctx context.Context, req MessageRequest) (int, erro
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", c.apiKey)
+	if c.authToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
+	} else if c.apiKey != "" {
+		httpReq.Header.Set("x-api-key", c.apiKey)
+	}
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -272,6 +350,11 @@ func (c *Client) CountTokens(ctx context.Context, req MessageRequest) (int, erro
 // SetAPIKey sets the API key.
 func (c *Client) SetAPIKey(apiKey string) {
 	c.apiKey = apiKey
+}
+
+// SetAuthToken sets the bearer token used for OAuth-style authentication.
+func (c *Client) SetAuthToken(authToken string) {
+	c.authToken = authToken
 }
 
 // SetBaseURL sets the base URL.

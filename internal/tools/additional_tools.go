@@ -428,7 +428,7 @@ func (t *ToolSearchTool) Call(ctx context.Context, args json.RawMessage, toolCtx
 	var results []string
 	query := strings.ToLower(input.Query)
 
-	for _, tool := range t.registry.List() {
+	for _, tool := range t.registry.ListEnabled() {
 		name := strings.ToLower(tool.Name())
 		desc, _ := tool.Description(ctx, nil, types.ToolOptions{})
 		descLower := strings.ToLower(desc)

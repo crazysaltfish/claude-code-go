@@ -18,6 +18,7 @@ import (
 
 // QueryEngineConfig contains configuration for the QueryEngine.
 type QueryEngineConfig struct {
+	SessionID          string
 	Cwd                string
 	Tools              []types.Tool
 	Commands           []types.Command
@@ -47,6 +48,7 @@ type QueryEngine struct {
 	mutableMessages    []types.Message
 	abortController    *types.AbortController
 	totalUsage         Usage
+	apiDuration        time.Duration
 	hasHandledOrphaned bool
 	readFileState      types.FileStateCache
 	mu                 sync.RWMutex
@@ -95,27 +97,32 @@ func NewQueryEngine(config QueryEngineConfig) *QueryEngine {
 		abortController = types.NewAbortController()
 	}
 
+	sessionID := config.SessionID
+	if sessionID == "" {
+		sessionID = generateSessionID()
+	}
 	return &QueryEngine{
 		config:          config,
 		mutableMessages: config.InitialMessages,
 		abortController: abortController,
 		totalUsage:      Usage{},
 		readFileState:   config.ReadFileCache,
-		sessionID:       generateSessionID(),
+		sessionID:       sessionID,
 	}
 }
 
 // SubmitMessage submits a message to the query engine and yields responses.
 func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan interface{}, error) {
-	e.startTime = time.Now()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	// Create output channel
 	output := make(chan interface{}, 100)
 
 	go func() {
 		defer close(output)
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.startTime = time.Now()
+		e.apiDuration = 0
+		e.totalUsage = Usage{}
 
 		// Process user input and get messages
 		userMessages := e.processUserInput(prompt)
@@ -136,7 +143,7 @@ func (e *QueryEngine) SubmitMessage(ctx context.Context, prompt string) (<-chan 
 		shouldQuery := e.shouldQueryAPI(prompt)
 		if !shouldQuery {
 			// Return early for slash commands that don't need API
-			output <- e.createResultMessage(0, "")
+			output <- e.createResultMessage(0, "", "")
 			return
 		}
 
@@ -164,8 +171,11 @@ func (e *QueryEngine) executeQueryLoop(ctx context.Context, output chan<- interf
 				SessionID: e.sessionID,
 				UUID:      generateUUID(),
 			}
+			output <- e.createErrorResultMessage("interrupted", "operation interrupted", turnCount)
 			return
 		}
+
+		turnCount++
 
 		// Build system prompt
 		systemPrompt := e.buildSystemPrompt()
@@ -191,7 +201,9 @@ func (e *QueryEngine) executeQueryLoop(ctx context.Context, output chan<- interf
 		}
 
 		// Call the API
+		apiStarted := time.Now()
 		response, err := e.callAPI(ctx, req)
+		e.apiDuration += time.Since(apiStarted)
 		if err != nil {
 			output <- SDKMessage{
 				Type:      "system",
@@ -199,6 +211,7 @@ func (e *QueryEngine) executeQueryLoop(ctx context.Context, output chan<- interf
 				SessionID: e.sessionID,
 				UUID:      generateUUID(),
 			}
+			output <- e.createErrorResultMessage("api_error", err.Error(), turnCount)
 			return
 		}
 
@@ -233,7 +246,7 @@ func (e *QueryEngine) executeQueryLoop(ctx context.Context, output chan<- interf
 		toolUseBlocks := e.extractToolUseBlocks(response)
 		if len(toolUseBlocks) == 0 {
 			// No tool use, we're done
-			output <- e.createResultMessage(turnCount, response.StopReason)
+			output <- e.createResultMessage(turnCount, response.StopReason, extractResponseText(response))
 			return
 		}
 
@@ -245,7 +258,6 @@ func (e *QueryEngine) executeQueryLoop(ctx context.Context, output chan<- interf
 			e.mutableMessages = append(e.mutableMessages, result)
 		}
 
-		turnCount++
 	}
 
 	// Max turns reached
@@ -254,7 +266,9 @@ func (e *QueryEngine) executeQueryLoop(ctx context.Context, output chan<- interf
 		Subtype:       "max_turns_reached",
 		IsError:       true,
 		DurationMs:    time.Since(e.startTime).Milliseconds(),
+		DurationApiMs: e.apiDuration.Milliseconds(),
 		NumTurns:      turnCount,
+		Result:        fmt.Sprintf("maximum turn limit reached (%d)", maxTurns),
 		SessionID:     e.sessionID,
 		TotalCostUsd:  e.calculateCost(),
 		Usage:         e.totalUsage,
@@ -475,29 +489,50 @@ func (e *QueryEngine) executeTools(ctx context.Context, blocks []api.ContentBloc
 					},
 				}),
 			})
+			output <- toolResultSDKMessage(e.sessionID, block.Name, block.ID, fmt.Sprintf("Unknown tool: %s", block.Name), true)
 			continue
+		}
+
+		if e.config.CanUseTool != nil {
+			decision, err := e.config.CanUseTool(ctx, block.Name, block.Input)
+			if err != nil {
+				results = append(results, toolErrorMessage(block.ID, err.Error()))
+				output <- toolResultSDKMessage(e.sessionID, block.Name, block.ID, err.Error(), true)
+				continue
+			}
+			if decision != nil && decision.Behavior != types.PermissionBehaviorAllow {
+				message := decision.Message
+				if message == "" {
+					message = fmt.Sprintf("permission %s for tool %s", decision.Behavior, block.Name)
+				}
+				results = append(results, toolErrorMessage(block.ID, message))
+				output <- toolResultSDKMessage(e.sessionID, block.Name, block.ID, message, true)
+				continue
+			}
 		}
 
 		// Execute the tool
 		toolCtx := &types.ToolContext{
-			ToolUseId:   block.ID,
-			Options:     types.ToolOptions{},
-			GetAppState: func() interface{} { return e.config.GetAppState() },
+			ToolUseId: block.ID,
+			Options:   types.ToolOptions{},
+			GetAppState: func() interface{} {
+				if e.config.GetAppState == nil {
+					return nil
+				}
+				return e.config.GetAppState()
+			},
 		}
 
 		result, err := tool.Call(ctx, block.Input, toolCtx, e.config.CanUseTool, nil, nil)
 		if err != nil {
-			results = append(results, types.Message{
-				Role: "user",
-				Content: mustMarshalJSON([]map[string]interface{}{
-					{
-						"type":        "tool_result",
-						"tool_use_id": block.ID,
-						"content":     err.Error(),
-						"is_error":    true,
-					},
-				}),
-			})
+			results = append(results, toolErrorMessage(block.ID, err.Error()))
+			output <- toolResultSDKMessage(e.sessionID, block.Name, block.ID, err.Error(), true)
+			continue
+		}
+		if result == nil {
+			message := fmt.Sprintf("tool %s returned no result", block.Name)
+			results = append(results, toolErrorMessage(block.ID, message))
+			output <- toolResultSDKMessage(e.sessionID, block.Name, block.ID, message, true)
 			continue
 		}
 
@@ -509,31 +544,39 @@ func (e *QueryEngine) executeTools(ctx context.Context, blocks []api.ContentBloc
 			content = fmt.Sprintf("%v", result.Output)
 		}
 
+		resultBlock := map[string]interface{}{
+			"type":        "tool_result",
+			"tool_use_id": block.ID,
+			"content":     content,
+		}
+		if result.Error != nil {
+			resultBlock["is_error"] = true
+		}
 		results = append(results, types.Message{
-			Role: "user",
-			Content: mustMarshalJSON([]map[string]interface{}{
-				{
-					"type":        "tool_result",
-					"tool_use_id": block.ID,
-					"content":     content,
-				},
-			}),
+			Role:    "user",
+			Content: mustMarshalJSON([]map[string]interface{}{resultBlock}),
 		})
 
 		// Yield progress
-		output <- SDKMessage{
-			Type: "tool_result",
-			Message: map[string]interface{}{
-				"tool_name":   block.Name,
-				"tool_use_id": block.ID,
-				"content":     content,
-			},
-			SessionID: e.sessionID,
-			UUID:      generateUUID(),
-		}
+		output <- toolResultSDKMessage(e.sessionID, block.Name, block.ID, content, result.Error != nil)
 	}
 
-	return results
+	return mergeToolResultMessages(results)
+}
+
+func mergeToolResultMessages(messages []types.Message) []types.Message {
+	if len(messages) <= 1 {
+		return messages
+	}
+	var blocks []map[string]interface{}
+	for _, message := range messages {
+		var content []map[string]interface{}
+		if err := json.Unmarshal(message.Content, &content); err != nil {
+			return messages
+		}
+		blocks = append(blocks, content...)
+	}
+	return []types.Message{{Role: "user", Content: mustMarshalJSON(blocks)}}
 }
 
 // findTool finds a tool by name.
@@ -552,12 +595,13 @@ func (e *QueryEngine) findTool(name string) types.Tool {
 }
 
 // createResultMessage creates a result message.
-func (e *QueryEngine) createResultMessage(turnCount int, stopReason string) ResultMessage {
+func (e *QueryEngine) createResultMessage(turnCount int, stopReason, result string) ResultMessage {
 	return ResultMessage{
 		Type:          "result",
 		Subtype:       "success",
 		IsError:       false,
 		DurationMs:    time.Since(e.startTime).Milliseconds(),
+		DurationApiMs: e.apiDuration.Milliseconds(),
 		NumTurns:      turnCount,
 		SessionID:     e.sessionID,
 		TotalCostUsd:  e.calculateCost(),
@@ -565,6 +609,64 @@ func (e *QueryEngine) createResultMessage(turnCount int, stopReason string) Resu
 		FastModeState: "disabled",
 		UUID:          generateUUID(),
 		StopReason:    stopReason,
+		Result:        result,
+	}
+}
+
+func (e *QueryEngine) createErrorResultMessage(subtype, result string, turnCount int) ResultMessage {
+	return ResultMessage{
+		Type:          "result",
+		Subtype:       subtype,
+		IsError:       true,
+		DurationMs:    time.Since(e.startTime).Milliseconds(),
+		DurationApiMs: e.apiDuration.Milliseconds(),
+		NumTurns:      turnCount,
+		Result:        result,
+		SessionID:     e.sessionID,
+		TotalCostUsd:  e.calculateCost(),
+		Usage:         e.totalUsage,
+		FastModeState: "disabled",
+		UUID:          generateUUID(),
+	}
+}
+
+func extractResponseText(response *api.MessageResponse) string {
+	if response == nil {
+		return ""
+	}
+	var text string
+	for _, block := range response.Content {
+		if block.Type == "text" {
+			if text != "" {
+				text += "\n"
+			}
+			text += block.Text
+		}
+	}
+	return text
+}
+
+func toolErrorMessage(toolUseID, message string) types.Message {
+	return types.Message{Role: "user", Content: mustMarshalJSON([]map[string]interface{}{{
+		"type":        "tool_result",
+		"tool_use_id": toolUseID,
+		"content":     message,
+		"is_error":    true,
+	}})}
+}
+
+func toolResultSDKMessage(sessionID, toolName, toolUseID, content string, isError bool) SDKMessage {
+	return SDKMessage{
+		Type: "tool_result",
+		Message: map[string]interface{}{
+			"tool_name":   toolName,
+			"tool_use_id": toolUseID,
+			"content":     content,
+			"is_error":    isError,
+		},
+		SessionID: sessionID,
+		UUID:      generateUUID(),
+		Timestamp: time.Now().UnixMilli(),
 	}
 }
 
@@ -595,6 +697,13 @@ func (e *QueryEngine) GetMessages() []types.Message {
 // GetSessionID returns the session ID.
 func (e *QueryEngine) GetSessionID() string {
 	return e.sessionID
+}
+
+// SetModel updates the model used by subsequent turns.
+func (e *QueryEngine) SetModel(model string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.config.UserSpecifiedModel = model
 }
 
 // Helper functions

@@ -1,50 +1,90 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"claude-code-go/internal/query"
-	"claude-code-go/internal/types"
 	"claude-code-go/internal/ui/components"
+	"claude-code-go/pkg/api"
 )
 
-// AppModel integrates QueryEngine with the Bubble Tea UI.
-type AppModel struct {
-	queryEngine  *query.QueryEngine
-	chat         *components.ChatModel
-	ctx          context.Context
-	cancel       context.CancelFunc
-	messageChan  <-chan interface{}
-	currentModel string
-	models       map[string]types.ThinkingConfig
-	mu           sync.RWMutex
-	err          error
+// SubmitFunc submits a prompt and returns the query event stream.
+type SubmitFunc func(context.Context, string) (<-chan interface{}, error)
+
+// PermissionRequest asks the UI to approve a tool call.
+type PermissionRequest struct {
+	ToolName    string
+	Input       json.RawMessage
+	ReadOnly    bool
+	Destructive bool
+	Response    chan bool
 }
 
-// NewAppModel creates a new UI app model.
+// AppModel integrates prompt dispatch and QueryEngine events with Bubble Tea.
+type AppModel struct {
+	chat               *components.ChatModel
+	ctx                context.Context
+	cancel             context.CancelFunc
+	messageChan        <-chan interface{}
+	submit             SubmitFunc
+	initialPrompt      string
+	permissionRequests <-chan PermissionRequest
+	pendingPermission  *PermissionRequest
+}
+
+// NewAppModel creates a UI model backed directly by a QueryEngine.
 func NewAppModel(engine *query.QueryEngine, width, height int) *AppModel {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewAppModelWithSubmit(engine.SubmitMessage, width, height)
+}
+
+// NewAppModelWithSubmit creates a UI model with a custom prompt dispatcher.
+func NewAppModelWithSubmit(submit SubmitFunc, width, height int) *AppModel {
+	return NewAppModelWithContext(context.Background(), submit, width, height)
+}
+
+// NewAppModelWithContext creates a UI model whose work is cancelled with parent.
+func NewAppModelWithContext(parent context.Context, submit SubmitFunc, width, height int) *AppModel {
+	ctx, cancel := context.WithCancel(parent)
 	return &AppModel{
-		queryEngine:  engine,
-		chat:         components.NewChatModel(width, height),
-		ctx:          ctx,
-		cancel:       cancel,
-		currentModel: "claude-sonnet-4-20250514",
-		models:       make(map[string]types.ThinkingConfig),
+		chat:   components.NewChatModel(width, height),
+		ctx:    ctx,
+		cancel: cancel,
+		submit: submit,
 	}
+}
+
+// SetInitialPrompt schedules a prompt after the UI starts.
+func (m *AppModel) SetInitialPrompt(prompt string) {
+	m.initialPrompt = prompt
+}
+
+// SetPermissionRequests connects interactive tool approval requests.
+func (m *AppModel) SetPermissionRequests(requests <-chan PermissionRequest) {
+	m.permissionRequests = requests
 }
 
 // Init initializes the app.
 func (m *AppModel) Init() tea.Cmd {
-	return tea.Batch(
-		m.chat.Init(),
-	)
+	cmds := []tea.Cmd{m.chat.Init()}
+	if m.initialPrompt != "" {
+		prompt := m.initialPrompt
+		cmds = append(cmds, func() tea.Msg { return submitPromptMsg{Prompt: prompt} })
+	}
+	if m.permissionRequests != nil {
+		cmds = append(cmds, m.waitForPermissionRequest())
+	}
+	return tea.Batch(cmds...)
 }
+
+type submitPromptMsg struct{ Prompt string }
+type queryCompleteMsg struct{}
+type permissionRequestMsg struct{ Request PermissionRequest }
 
 // Update handles app updates.
 func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -56,6 +96,37 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.chat.Height = msg.Height
 
 	case tea.KeyMsg:
+		if m.pendingPermission != nil {
+			if msg.Type == tea.KeyCtrlC {
+				m.pendingPermission.Response <- false
+				m.chat.ClearApproval()
+				m.cancel()
+				return m, tea.Quit
+			}
+			if msg.Type == tea.KeyUp {
+				m.chat.ScrollApprovalUp()
+				return m, nil
+			}
+			if msg.Type == tea.KeyDown {
+				m.chat.ScrollApprovalDown()
+				return m, nil
+			}
+			switch strings.ToLower(msg.String()) {
+			case "y":
+				m.pendingPermission.Response <- true
+				m.chat.AddSystemMessage(fmt.Sprintf("Allowed tool: %s", m.pendingPermission.ToolName))
+				m.chat.ClearApproval()
+				m.pendingPermission = nil
+				cmds = append(cmds, m.waitForPermissionRequest())
+			case "n", "esc":
+				m.pendingPermission.Response <- false
+				m.chat.AddSystemMessage(fmt.Sprintf("Denied tool: %s", m.pendingPermission.ToolName))
+				m.chat.ClearApproval()
+				m.pendingPermission = nil
+				cmds = append(cmds, m.waitForPermissionRequest())
+			}
+			return m, tea.Batch(cmds...)
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.cancel()
@@ -64,18 +135,15 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.chat.State == components.ChatStateIdle && m.chat.Input.Value != "" {
 				prompt := m.chat.Input.Value
 				m.chat.Input.Clear()
-				m.chat.State = components.ChatStateProcessing
-
-				// Submit message to query engine
-				output, err := m.queryEngine.SubmitMessage(m.ctx, prompt)
-				if err != nil {
-					m.chat.State = components.ChatStateError
-					m.chat.Error = err
-					return m, nil
+				if cmd := m.startQuery(prompt); cmd != nil {
+					cmds = append(cmds, cmd)
 				}
-				m.messageChan = output
-				cmds = append(cmds, m.waitForMessages())
 			}
+		}
+
+	case submitPromptMsg:
+		if cmd := m.startQuery(msg.Prompt); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 
 	case QueryEngineMsg:
@@ -85,14 +153,78 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case query.ResultMessage:
 			m.handleResultMessage(data)
 		}
+		cmds = append(cmds, m.waitForMessages())
+
+	case queryCompleteMsg:
+		if m.chat.State == components.ChatStateProcessing {
+			m.chat.State = components.ChatStateIdle
+		}
+
+	case permissionRequestMsg:
+		m.pendingPermission = &msg.Request
+		m.chat.SetApproval(formatPermissionRequest(msg.Request))
 	}
 
-	// Update chat component
 	newChat, cmd := m.chat.Update(msg)
 	m.chat = newChat.(*components.ChatModel)
 	cmds = append(cmds, cmd)
-
 	return m, tea.Batch(cmds...)
+}
+
+func formatPermissionRequest(request PermissionRequest) string {
+	impact := "modifies state"
+	if request.Destructive {
+		impact = "potentially destructive"
+	} else if request.ReadOnly {
+		impact = "read-only"
+	}
+
+	input := "{}"
+	if len(request.Input) > 0 {
+		var formatted bytes.Buffer
+		if err := json.Indent(&formatted, request.Input, "", "  "); err == nil {
+			input = formatted.String()
+		} else {
+			input = string(request.Input)
+		}
+	}
+
+	return fmt.Sprintf(
+		"Permission required\nTool: %s\nImpact: %s\nRead-only: %t\nDestructive: %t\nInput:\n%s",
+		request.ToolName,
+		impact,
+		request.ReadOnly,
+		request.Destructive,
+		input,
+	)
+}
+
+func (m *AppModel) waitForPermissionRequest() tea.Cmd {
+	return func() tea.Msg {
+		request, ok := <-m.permissionRequests
+		if !ok {
+			return nil
+		}
+		return permissionRequestMsg{Request: request}
+	}
+}
+
+func (m *AppModel) startQuery(prompt string) tea.Cmd {
+	m.chat.AddUserMessage(prompt)
+	m.chat.ClearError()
+	m.chat.State = components.ChatStateProcessing
+	if m.submit == nil {
+		m.chat.SetError(fmt.Errorf("query submitter is not configured"))
+		return nil
+	}
+
+	output, err := m.submit(m.ctx, prompt)
+	if err != nil {
+		m.chat.SetError(err)
+		return nil
+	}
+	m.messageChan = output
+	return m.waitForMessages()
 }
 
 // View renders the app.
@@ -101,44 +233,33 @@ func (m *AppModel) View() string {
 }
 
 // QueryEngineMsg wraps messages from QueryEngine for Bubble Tea.
-type QueryEngineMsg struct {
-	Data interface{}
-}
+type QueryEngineMsg struct{ Data interface{} }
 
-// waitForMessages waits for messages from the QueryEngine.
 func (m *AppModel) waitForMessages() tea.Cmd {
 	return func() tea.Msg {
 		if m.messageChan == nil {
-			return nil
+			return queryCompleteMsg{}
 		}
-
 		data, ok := <-m.messageChan
 		if !ok {
-			m.chat.State = components.ChatStateIdle
-			return nil
+			return queryCompleteMsg{}
 		}
-
 		return QueryEngineMsg{Data: data}
 	}
 }
 
-// handleSDKMessage handles SDK messages from QueryEngine.
 func (m *AppModel) handleSDKMessage(msg query.SDKMessage) {
 	switch msg.Type {
 	case "assistant":
-		if content, ok := msg.Message.(map[string]interface{}); ok {
-			if contentBlocks, ok := content["content"].([]map[string]interface{}); ok {
-				var textParts []string
-				for _, block := range contentBlocks {
-					if block["type"] == "text" {
-						if text, ok := block["text"].(string); ok {
-							textParts = append(textParts, text)
-						}
-					}
+		if response, ok := msg.Message.(*api.MessageResponse); ok {
+			var textParts []string
+			for _, block := range response.Content {
+				if block.Type == "text" && block.Text != "" {
+					textParts = append(textParts, block.Text)
 				}
-				if len(textParts) > 0 {
-					m.chat.AddAssistantMessage(strings.Join(textParts, "\n"))
-				}
+			}
+			if len(textParts) > 0 {
+				m.chat.AddAssistantMessage(strings.Join(textParts, "\n"))
 			}
 		}
 
@@ -151,42 +272,37 @@ func (m *AppModel) handleSDKMessage(msg query.SDKMessage) {
 
 	case "system":
 		if data, ok := msg.Message.(map[string]interface{}); ok {
-			if subtype, ok := data["subtype"].(string); ok {
-				switch subtype {
-				case "interrupted":
-					m.chat.State = components.ChatStateIdle
-					m.chat.AddSystemMessage("Operation interrupted")
-				case "error":
-					if errMsg, ok := data["error"].(string); ok {
-						m.chat.State = components.ChatStateError
-						m.chat.Error = fmt.Errorf("%s", errMsg)
-					}
+			subtype, _ := data["subtype"].(string)
+			switch subtype {
+			case "interrupted":
+				m.chat.AddSystemMessage("Operation interrupted")
+			case "error":
+				if errMsg, ok := data["error"].(string); ok {
+					m.chat.SetError(fmt.Errorf("%s", errMsg))
+				}
+			case "message":
+				if content, ok := data["content"].(string); ok {
+					m.chat.AddSystemMessage(content)
 				}
 			}
 		}
 	}
 }
 
-// handleResultMessage handles result messages from QueryEngine.
 func (m *AppModel) handleResultMessage(msg query.ResultMessage) {
-	m.chat.State = components.ChatStateIdle
-
 	if msg.IsError {
-		m.chat.Error = fmt.Errorf("query failed: %s", msg.Subtype)
-	} else {
-		duration := fmt.Sprintf("%.2fs", float64(msg.DurationMs)/1000.0)
-		cost := fmt.Sprintf("$%.6f", msg.TotalCostUsd)
-		m.chat.AddSystemMessage(fmt.Sprintf("Completed in %s | Cost: %s | Turns: %d", duration, cost, msg.NumTurns))
+		m.chat.SetError(fmt.Errorf("query failed: %s: %s", msg.Subtype, msg.Result))
+		return
 	}
+	m.chat.State = components.ChatStateIdle
+	duration := fmt.Sprintf("%.2fs", float64(msg.DurationMs)/1000.0)
+	cost := fmt.Sprintf("$%.6f", msg.TotalCostUsd)
+	m.chat.AddSystemMessage(fmt.Sprintf("Completed in %s | Cost: %s | Turns: %d", duration, cost, msg.NumTurns))
 }
 
 // RunUI runs the interactive UI.
 func RunUI(engine *query.QueryEngine) error {
-	p := tea.NewProgram(
-		NewAppModel(engine, 80, 24),
-		tea.WithAltScreen(),
-	)
-
+	p := tea.NewProgram(NewAppModel(engine, 80, 24), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }

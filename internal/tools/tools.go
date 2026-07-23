@@ -1002,6 +1002,8 @@ func NewToolRegistry() *Registry {
 	r.Register(taskCreateTool)
 	r.Register(NewTaskListTool(taskCreateTool))
 	r.Register(NewTaskStopTool(taskCreateTool))
+	r.Register(NewTaskGetTool(taskCreateTool))
+	r.Register(NewTaskUpdateTool(taskCreateTool))
 	r.Register(NewTaskTool())
 
 	// Register advanced editing tools
@@ -1022,6 +1024,11 @@ func NewToolRegistry() *Registry {
 
 	// Register config tool
 	r.Register(NewConfigTool())
+
+	// Register standalone utility tools with complete local behavior.
+	r.Register(NewSleepTool())
+	r.Register(NewPowerShellTool())
+	r.Register(NewToolSearchTool(r))
 
 	return r
 }

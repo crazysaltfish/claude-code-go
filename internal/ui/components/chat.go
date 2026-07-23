@@ -27,6 +27,12 @@ var (
 
 	dividerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("62"))
+
+	approvalStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("214")).
+			Foreground(lipgloss.Color("230")).
+			Padding(0, 1)
 )
 
 // ChatState represents the state of the chat interface.
@@ -41,15 +47,17 @@ const (
 
 // ChatModel represents the main chat interface.
 type ChatModel struct {
-	Messages    *MessageListModel
-	Input       *InputModel
-	Status      *StatusBarModel
-	Spinner     *SpinnerModel
-	State       ChatState
-	Width       int
-	Height      int
-	Error       error
-	HelpVisible bool
+	Messages       *MessageListModel
+	Input          *InputModel
+	Status         *StatusBarModel
+	Spinner        *SpinnerModel
+	State          ChatState
+	Width          int
+	Height         int
+	Error          error
+	HelpVisible    bool
+	ApprovalText   string
+	ApprovalOffset int
 }
 
 // NewChatModel creates a new chat interface.
@@ -80,7 +88,7 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Width = msg.Width
 		m.Height = msg.Height
 		m.Messages.Width = msg.Width
-		m.Messages.Height = msg.Height - 6
+		m.updateMessageViewport()
 		m.Input.Width = msg.Width - 4
 		m.Status.Width = msg.Width
 
@@ -132,6 +140,13 @@ func (m *ChatModel) View() string {
 	} else if m.State == ChatStateError {
 		b.WriteString(errorStyle.Render(m.Error.Error()) + "\n")
 	}
+	if m.ApprovalText != "" {
+		approvalWidth := m.Width - 6
+		if approvalWidth < 20 {
+			approvalWidth = 20
+		}
+		b.WriteString(approvalStyle.Width(approvalWidth).Render(m.approvalView()) + "\n")
+	}
 
 	// Input area
 	b.WriteString(dividerStyle.Render(strings.Repeat("─", m.Width)) + "\n")
@@ -139,7 +154,9 @@ func (m *ChatModel) View() string {
 
 	// Footer with help
 	footerText := "Ctrl+C: quit | Ctrl+H: help | Enter: send"
-	if m.HelpVisible {
+	if m.ApprovalText != "" {
+		footerText = "↑↓: inspect call | y: allow once | n/Esc: deny | Ctrl+C: quit"
+	} else if m.HelpVisible {
 		footerText = "↑↓: scroll | Ctrl+C: quit | Ctrl+H: hide help | Enter: send"
 	}
 	b.WriteString(chatFooterStyle.Render(footerText))
@@ -153,7 +170,14 @@ func (m *ChatModel) AddAssistantMessage(content string) {
 		Role:    "assistant",
 		Content: []ContentBlock{{Type: "text", Text: content}},
 	})
-	m.State = ChatStateIdle
+}
+
+// AddUserMessage adds a user message.
+func (m *ChatModel) AddUserMessage(content string) {
+	m.Messages.AddMessage(MessageModel{
+		Role:    "user",
+		Content: []ContentBlock{{Type: "text", Text: content}},
+	})
 }
 
 // AddSystemMessage adds a system message.
@@ -170,6 +194,100 @@ func (m *ChatModel) AddToolResult(toolName, content string) {
 		Role:    "tool_result",
 		Content: []ContentBlock{{Type: "tool_result", Text: fmt.Sprintf("%s: %s", toolName, content)}},
 	})
+}
+
+// SetApproval displays a tool approval panel.
+func (m *ChatModel) SetApproval(content string) {
+	m.ApprovalText = content
+	m.ApprovalOffset = 0
+	m.updateMessageViewport()
+}
+
+// ClearApproval removes the current tool approval panel.
+func (m *ChatModel) ClearApproval() {
+	m.ApprovalText = ""
+	m.ApprovalOffset = 0
+	m.updateMessageViewport()
+}
+
+// ScrollApprovalUp scrolls the complete tool call toward its beginning.
+func (m *ChatModel) ScrollApprovalUp() {
+	if m.ApprovalOffset > 0 {
+		m.ApprovalOffset--
+	}
+}
+
+// ScrollApprovalDown scrolls the complete tool call toward its end.
+func (m *ChatModel) ScrollApprovalDown() {
+	lines := m.approvalLines()
+	maxOffset := len(lines) - m.approvalViewportHeight()
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.ApprovalOffset < maxOffset {
+		m.ApprovalOffset++
+	}
+}
+
+func (m *ChatModel) approvalView() string {
+	lines := m.approvalLines()
+	viewportHeight := m.approvalViewportHeight()
+	maxOffset := len(lines) - viewportHeight
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.ApprovalOffset > maxOffset {
+		m.ApprovalOffset = maxOffset
+	}
+
+	end := m.ApprovalOffset + viewportHeight
+	if end > len(lines) {
+		end = len(lines)
+	}
+	visible := strings.Join(lines[m.ApprovalOffset:end], "\n")
+	if len(lines) > viewportHeight {
+		visible += fmt.Sprintf(
+			"\n[%d-%d of %d lines]",
+			m.ApprovalOffset+1,
+			end,
+			len(lines),
+		)
+	}
+	return visible + "\n\n[y] Allow once    [n/Esc] Deny"
+}
+
+func (m *ChatModel) approvalLines() []string {
+	if m.ApprovalText == "" {
+		return nil
+	}
+	width := m.Width - 10
+	if width < 20 {
+		width = 20
+	}
+	return strings.Split(wrapText(m.ApprovalText, width), "\n")
+}
+
+func (m *ChatModel) approvalViewportHeight() int {
+	height := m.Height / 3
+	if height < 6 {
+		height = 6
+	}
+	if height > 14 {
+		height = 14
+	}
+	return height
+}
+
+func (m *ChatModel) updateMessageViewport() {
+	height := m.Height - 10
+	if m.ApprovalText != "" {
+		height -= m.approvalViewportHeight() + 5
+	}
+	if height < 3 {
+		height = 3
+	}
+	m.Messages.Height = height
+	m.Messages.MaxVisible = height
 }
 
 // SetError sets an error state.
